@@ -1,0 +1,78 @@
+@Banking_API_HostAddress = http://localhost:5129
+@accessToken = REPLACE_WITH_JWT
+@customerId = 00000000-0000-0000-0000-000000000000
+@accountId = 00000000-0000-0000-0000-000000000000
+@toAccountId = 00000000-0000-0000-0000-000000000000
+
+### Login
+POST {{Banking_API_HostAddress}}/api/auth/login
+Content-Type: application/json
+
+{
+  "username": "admin",
+  "password": "Admin@12345"
+}
+
+### Create Customer
+POST {{Banking_API_HostAddress}}/api/customers
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "fullName": "John Doe",
+  "email": "john.doe@example.com",
+  "phoneNumber": "+919999999999"
+}
+
+### Open Account
+POST {{Banking_API_HostAddress}}/api/accounts
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "customerId": "{{customerId}}",
+  "accountType": 1,
+  "currency": "INR",
+  "dailyDebitLimit": 50000
+}
+
+### Deposit
+POST {{Banking_API_HostAddress}}/api/transactions/deposit
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "accountId": "{{accountId}}",
+  "amount": 1000.00,
+  "narrative": "Cash deposit",
+  "reference": "DEP-1001"
+}
+
+### Withdraw
+POST {{Banking_API_HostAddress}}/api/transactions/withdraw
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "accountId": "{{accountId}}",
+  "amount": 250.00,
+  "narrative": "ATM withdrawal",
+  "reference": "WDR-1001"
+}
+
+### Transfer
+POST {{Banking_API_HostAddress}}/api/transactions/transfer
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "fromAccountId": "{{accountId}}",
+  "toAccountId": "{{toAccountId}}",
+  "amount": 300.00,
+  "narrative": "Internal transfer",
+  "externalReference": "TRF-1001"
+}
+
+### Account Statement
+GET {{Banking_API_HostAddress}}/api/accounts/{{accountId}}/statement?fromUtc=2026-01-01T00:00:00Z&toUtc=2026-12-31T23:59:59Z
+Authorization: Bearer {{accessToken}}
