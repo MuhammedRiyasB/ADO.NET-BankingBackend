@@ -42,19 +42,26 @@ public sealed class CustomerService : ICustomerService
             return Result<CustomerResponse>.Failure(ErrorCodes.Validation, "Phone number must have at least 8 characters.");
         }
 
-        var existing = await _customerRepository.GetByEmailAsync(email, cancellationToken);
-        if (existing is not null)
+        var customer = Customer.CreateNew(fullName, email, phoneNumber, _clock.UtcNow);
+
+        try
         {
+            await _unitOfWork.BeginTransactionAsync(cancellationToken);
+            await _customerRepository.AddAsync(customer, cancellationToken);
+            await _unitOfWork.CommitAsync(cancellationToken);
+
+            return Result<CustomerResponse>.Success(Map(customer));
+        }
+        catch (DuplicateResourceException)
+        {
+            await _unitOfWork.RollbackAsync(cancellationToken);
             return Result<CustomerResponse>.Failure(ErrorCodes.Conflict, "A customer with this email already exists.");
         }
-
-        var customer = Customer.CreateNew(fullName, email, phoneNumber, _clock.UtcNow);
-        
-        await _unitOfWork.BeginTransactionAsync(cancellationToken);
-        await _customerRepository.AddAsync(customer, cancellationToken);
-        await _unitOfWork.CommitAsync(cancellationToken);
-
-        return Result<CustomerResponse>.Success(Map(customer));
+        catch
+        {
+            await _unitOfWork.RollbackAsync(cancellationToken);
+            throw;
+        }
     }
 
     public async Task<Result<CustomerResponse>> GetByIdAsync(Guid customerId, CancellationToken cancellationToken)

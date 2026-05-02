@@ -1,3 +1,4 @@
+using Banking.Application.Common;
 using Banking.Application.Interfaces;
 using Banking.Domain.Entities;
 using Banking.Domain.Enums;
@@ -65,7 +66,14 @@ VALUES
         command.Parameters.Add(new SqlParameter("@Narrative", System.Data.SqlDbType.NVarChar, 300) { Value = entry.Narrative });
         command.Parameters.Add(new SqlParameter("@CreatedAtUtc", System.Data.SqlDbType.DateTime2) { Value = entry.CreatedAtUtc });
 
-            await command.ExecuteNonQueryAsync(cancellationToken);
+            try
+            {
+                await command.ExecuteNonQueryAsync(cancellationToken);
+            }
+            catch (SqlException ex) when (ex.IsUniqueConstraintViolation())
+            {
+                throw new DuplicateResourceException("ledger entry", "reference", entry.Reference, ex);
+            }
         }, cancellationToken);
     }
 

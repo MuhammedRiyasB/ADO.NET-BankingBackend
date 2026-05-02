@@ -63,12 +63,19 @@ internal sealed class SqlUnitOfWork : IUnitOfWork, IAsyncDisposable
     {
         if (_transaction is not null)
         {
+            if (_transaction.Connection is not null)
+            {
+                await _transaction.RollbackAsync();
+            }
+
             await _transaction.DisposeAsync();
+            _transaction = null;
         }
 
         if (_connection is not null)
         {
             await _connection.DisposeAsync();
+            _connection = null;
         }
     }
 }

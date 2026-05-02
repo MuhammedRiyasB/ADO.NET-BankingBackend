@@ -12,33 +12,29 @@ using Microsoft.OpenApi.Models;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// ── Bind secrets from environment variables ──────────────────────────
 var dbConnection = Environment.GetEnvironmentVariable("BANKING_DB_CONNECTION");
 var jwtSigningKey = Environment.GetEnvironmentVariable("BANKING_JWT_SIGNING_KEY");
 var adminPassword = Environment.GetEnvironmentVariable("BANKING_ADMIN_PASSWORD");
-
-if (string.IsNullOrWhiteSpace(dbConnection))
+bool? runMigrationsFromEnvironment = null;
+if (bool.TryParse(Environment.GetEnvironmentVariable("BANKING_RUN_MIGRATIONS"), out var runMigrationsFlag))
 {
-    throw new InvalidOperationException(
-        "Environment variable 'BANKING_DB_CONNECTION' is required. Set it to your SQL Server connection string.");
+    runMigrationsFromEnvironment = runMigrationsFlag;
 }
 
-if (string.IsNullOrWhiteSpace(jwtSigningKey) || jwtSigningKey.Length < 32)
+if (!string.IsNullOrWhiteSpace(dbConnection))
 {
-    throw new InvalidOperationException(
-        "Environment variable 'BANKING_JWT_SIGNING_KEY' is required and must be at least 32 characters.");
+    builder.Configuration["SqlServer:ConnectionString"] = dbConnection;
 }
 
-if (string.IsNullOrWhiteSpace(adminPassword))
+if (!string.IsNullOrWhiteSpace(jwtSigningKey))
 {
-    throw new InvalidOperationException(
-        "Environment variable 'BANKING_ADMIN_PASSWORD' is required. Set it to the initial admin user password.");
+    builder.Configuration["Jwt:SigningKey"] = jwtSigningKey;
 }
 
-builder.Configuration["SqlServer:ConnectionString"] = dbConnection;
-builder.Configuration["Jwt:SigningKey"] = jwtSigningKey;
-builder.Configuration["AdminSeed:Password"] = adminPassword;
-// ─────────────────────────────────────────────────────────────────────
+if (!string.IsNullOrWhiteSpace(adminPassword))
+{
+    builder.Configuration["AdminSeed:Password"] = adminPassword;
+}
 
 builder.Services.AddApplication();
 builder.Services.AddInfrastructure(builder.Configuration);
@@ -58,6 +54,13 @@ builder.Services.AddRateLimiter(options =>
 });
 
 var jwtOptions = builder.Configuration.GetSection(JwtOptions.SectionName).Get<JwtOptions>() ?? new JwtOptions();
+var initOptions = builder.Configuration.GetSection(DatabaseInitializationOptions.SectionName).Get<DatabaseInitializationOptions>()
+    ?? new DatabaseInitializationOptions();
+var runMigrations = args.Contains("--migrate", StringComparer.OrdinalIgnoreCase)
+    || runMigrationsFromEnvironment == true
+    || (runMigrationsFromEnvironment is null && builder.Environment.IsDevelopment() && initOptions.RunOnStartup);
+
+ValidateConfiguration(builder.Configuration, jwtOptions, runMigrations);
 
 var signingKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtOptions.SigningKey));
 builder.Services
@@ -117,8 +120,9 @@ builder.Services.AddSwaggerGen(options =>
 
 var app = builder.Build();
 
-using (var scope = app.Services.CreateScope())
+if (runMigrations)
 {
+    using var scope = app.Services.CreateScope();
     var databaseInitializer = scope.ServiceProvider.GetRequiredService<IDatabaseInitializer>();
     await databaseInitializer.InitializeAsync(CancellationToken.None);
 }
@@ -141,3 +145,30 @@ app.UseAuthorization();
 app.MapControllers().RequireRateLimiting("api");
 
 app.Run();
+
+static void ValidateConfiguration(IConfiguration configuration, JwtOptions jwtOptions, bool runMigrations)
+{
+    var errors = new List<string>();
+    var sqlOptions = configuration.GetSection(SqlServerOptions.SectionName).Get<SqlServerOptions>() ?? new SqlServerOptions();
+    var adminOptions = configuration.GetSection(AdminSeedOptions.SectionName).Get<AdminSeedOptions>() ?? new AdminSeedOptions();
+
+    if (string.IsNullOrWhiteSpace(sqlOptions.ConnectionString))
+    {
+        errors.Add("SqlServer:ConnectionString or BANKING_DB_CONNECTION is required.");
+    }
+
+    if (string.IsNullOrWhiteSpace(jwtOptions.SigningKey) || jwtOptions.SigningKey.Length < 32)
+    {
+        errors.Add("Jwt:SigningKey or BANKING_JWT_SIGNING_KEY is required and must be at least 32 characters.");
+    }
+
+    if (runMigrations && string.IsNullOrWhiteSpace(adminOptions.Password))
+    {
+        errors.Add("AdminSeed:Password or BANKING_ADMIN_PASSWORD is required when migrations are enabled.");
+    }
+
+    if (errors.Count > 0)
+    {
+        throw new InvalidOperationException(string.Join(Environment.NewLine, errors));
+    }
+}

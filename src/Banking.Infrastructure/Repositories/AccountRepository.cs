@@ -1,3 +1,4 @@
+using Banking.Application.Common;
 using Banking.Application.Interfaces;
 using Banking.Domain.Entities;
 using Banking.Domain.Enums;
@@ -119,7 +120,14 @@ VALUES
             command.Parameters.Add(new SqlParameter("@CreatedAtUtc", System.Data.SqlDbType.DateTime2) { Value = account.CreatedAtUtc });
             command.Parameters.Add(new SqlParameter("@LastUpdatedAtUtc", System.Data.SqlDbType.DateTime2) { Value = account.LastUpdatedAtUtc });
 
-            await command.ExecuteNonQueryAsync(cancellationToken);
+            try
+            {
+                await command.ExecuteNonQueryAsync(cancellationToken);
+            }
+            catch (SqlException ex) when (ex.IsUniqueConstraintViolation())
+            {
+                throw new DuplicateResourceException("account", "account number", account.AccountNumber, ex);
+            }
         }, cancellationToken);
     }
 

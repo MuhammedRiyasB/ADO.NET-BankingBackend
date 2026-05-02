@@ -62,10 +62,108 @@ public sealed class TransferService : ITransferService
         }
 
         var externalReference = _referenceNormalizer.Normalize(request.ExternalReference);
-        var existingTransfer = await _transferRepository.GetByExternalReferenceAsync(externalReference, cancellationToken);
-        if (existingTransfer is not null)
+
+        try
         {
-            if (existingTransfer.Status == TransferStatus.Completed)
+            await _unitOfWork.BeginTransactionAsync(cancellationToken);
+
+            var lockFirstId = request.FromAccountId.CompareTo(request.ToAccountId) <= 0 ? request.FromAccountId : request.ToAccountId;
+            var lockSecondId = lockFirstId == request.FromAccountId ? request.ToAccountId : request.FromAccountId;
+
+            var first = await _accountRepository.GetByIdForUpdateAsync(lockFirstId, cancellationToken);
+            var second = await _accountRepository.GetByIdForUpdateAsync(lockSecondId, cancellationToken);
+
+            if (first is null || second is null)
+            {
+                await _unitOfWork.RollbackAsync(cancellationToken);
+                return Result<TransferResponse>.Failure(ErrorCodes.NotFound, "One or both accounts were not found.");
+            }
+
+            var fromAccount = first.Id == request.FromAccountId ? first : second;
+            var toAccount = first.Id == request.ToAccountId ? first : second;
+
+            if (!fromAccount.IsActive || !toAccount.IsActive)
+            {
+                await _unitOfWork.RollbackAsync(cancellationToken);
+                return Result<TransferResponse>.Failure(ErrorCodes.BusinessRule, "Both accounts must be active.");
+            }
+
+            var now = _clock.UtcNow;
+            if (await _limitChecker.WouldExceedDailyLimitAsync(
+                fromAccount.Id,
+                fromAccount.DailyDebitLimit,
+                request.Amount,
+                now,
+                cancellationToken))
+            {
+                await _unitOfWork.RollbackAsync(cancellationToken);
+                return Result<TransferResponse>.Failure(ErrorCodes.BusinessRule, "Daily debit limit exceeded.");
+            }
+
+            Transfer transfer;
+            try
+            {
+                transfer = Transfer.CreatePending(
+                    externalReference,
+                    fromAccount,
+                    toAccount,
+                    request.Amount,
+                    request.Narrative.Trim(),
+                    now);
+            }
+            catch (InvalidOperationException ex)
+            {
+                await _unitOfWork.RollbackAsync(cancellationToken);
+                return Result<TransferResponse>.Failure(ErrorCodes.BusinessRule, ex.Message);
+            }
+
+            await _transferRepository.AddAsync(transfer, cancellationToken);
+
+            try
+            {
+                fromAccount.Debit(request.Amount, now);
+                toAccount.Credit(request.Amount, now);
+                transfer.MarkCompleted(now);
+            }
+            catch (InvalidOperationException ex)
+            {
+                await _unitOfWork.RollbackAsync(cancellationToken);
+                return Result<TransferResponse>.Failure(ErrorCodes.BusinessRule, ex.Message);
+            }
+
+            var debitEntry = LedgerEntry.Create(
+                fromAccount.Id,
+                $"{externalReference}-DR",
+                LedgerEntryType.Debit,
+                request.Amount,
+                fromAccount.Balance,
+                $"Transfer to {toAccount.AccountNumber}: {request.Narrative.Trim()}",
+                now);
+
+            var creditEntry = LedgerEntry.Create(
+                toAccount.Id,
+                $"{externalReference}-CR",
+                LedgerEntryType.Credit,
+                request.Amount,
+                toAccount.Balance,
+                $"Transfer from {fromAccount.AccountNumber}: {request.Narrative.Trim()}",
+                now);
+
+            await _accountRepository.UpdateAsync(fromAccount, cancellationToken);
+            await _accountRepository.UpdateAsync(toAccount, cancellationToken);
+            await _ledgerRepository.AddAsync(debitEntry, cancellationToken);
+            await _ledgerRepository.AddAsync(creditEntry, cancellationToken);
+            await _transferRepository.UpdateAsync(transfer, cancellationToken);
+
+            await _unitOfWork.CommitAsync(cancellationToken);
+            return Result<TransferResponse>.Success(_transferMapper.Map(transfer));
+        }
+        catch (DuplicateResourceException)
+        {
+            await _unitOfWork.RollbackAsync(cancellationToken);
+
+            var existingTransfer = await _transferRepository.GetByExternalReferenceAsync(externalReference, cancellationToken);
+            if (existingTransfer is not null && existingTransfer.Status == TransferStatus.Completed)
             {
                 return Result<TransferResponse>.Success(_transferMapper.Map(existingTransfer));
             }
@@ -74,84 +172,10 @@ public sealed class TransferService : ITransferService
                 ErrorCodes.Conflict,
                 "A transfer with this external reference already exists.");
         }
-
-        await _unitOfWork.BeginTransactionAsync(cancellationToken);
-
-        var lockFirstId = request.FromAccountId.CompareTo(request.ToAccountId) <= 0 ? request.FromAccountId : request.ToAccountId;
-        var lockSecondId = lockFirstId == request.FromAccountId ? request.ToAccountId : request.FromAccountId;
-
-        var first = await _accountRepository.GetByIdForUpdateAsync(lockFirstId, cancellationToken);
-        var second = await _accountRepository.GetByIdForUpdateAsync(lockSecondId, cancellationToken);
-
-        if (first is null || second is null)
+        catch
         {
-            return Result<TransferResponse>.Failure(ErrorCodes.NotFound, "One or both accounts were not found.");
+            await _unitOfWork.RollbackAsync(cancellationToken);
+            throw;
         }
-
-        var fromAccount = first.Id == request.FromAccountId ? first : second;
-        var toAccount = first.Id == request.ToAccountId ? first : second;
-
-        if (!fromAccount.IsActive || !toAccount.IsActive)
-        {
-            return Result<TransferResponse>.Failure(ErrorCodes.BusinessRule, "Both accounts must be active.");
-        }
-
-        var now = _clock.UtcNow;
-        if (await _limitChecker.WouldExceedDailyLimitAsync(
-            fromAccount.Id,
-            fromAccount.DailyDebitLimit,
-            request.Amount,
-            now,
-            cancellationToken))
-        {
-            return Result<TransferResponse>.Failure(ErrorCodes.BusinessRule, "Daily debit limit exceeded.");
-        }
-
-        Transfer transfer;
-        try
-        {
-            transfer = Transfer.CreatePending(
-                externalReference,
-                fromAccount,
-                toAccount,
-                request.Amount,
-                request.Narrative.Trim(),
-                now);
-            
-            fromAccount.Debit(request.Amount, now);
-            toAccount.Credit(request.Amount, now);
-            transfer.MarkCompleted(now);
-        }
-        catch (InvalidOperationException ex)
-        {
-            return Result<TransferResponse>.Failure(ErrorCodes.BusinessRule, ex.Message);
-        }
-
-        var debitEntry = LedgerEntry.Create(
-            fromAccount.Id,
-            $"{externalReference}-DR",
-            LedgerEntryType.Debit,
-            request.Amount,
-            fromAccount.Balance,
-            $"Transfer to {toAccount.AccountNumber}: {request.Narrative.Trim()}",
-            now);
-
-        var creditEntry = LedgerEntry.Create(
-            toAccount.Id,
-            $"{externalReference}-CR",
-            LedgerEntryType.Credit,
-            request.Amount,
-            toAccount.Balance,
-            $"Transfer from {fromAccount.AccountNumber}: {request.Narrative.Trim()}",
-            now);
-
-        await _accountRepository.UpdateAsync(fromAccount, cancellationToken);
-        await _accountRepository.UpdateAsync(toAccount, cancellationToken);
-        await _transferRepository.AddAsync(transfer, cancellationToken);
-        await _ledgerRepository.AddAsync(debitEntry, cancellationToken);
-        await _ledgerRepository.AddAsync(creditEntry, cancellationToken);
-
-        await _unitOfWork.CommitAsync(cancellationToken);
-        return Result<TransferResponse>.Success(_transferMapper.Map(transfer));
     }
 }

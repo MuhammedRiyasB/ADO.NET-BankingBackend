@@ -58,58 +58,71 @@ public sealed class WithdrawService : IWithdrawService
         }
 
         var reference = _referenceNormalizer.Normalize(request.Reference);
-        if (await _ledgerRepository.ReferenceExistsAsync(reference, cancellationToken))
-        {
-            return Result<TransactionResponse>.Failure(ErrorCodes.Conflict, "Reference has already been processed.");
-        }
-
-        await _unitOfWork.BeginTransactionAsync(cancellationToken);
-        var account = await _accountRepository.GetByIdForUpdateAsync(request.AccountId, cancellationToken);
-        if (account is null)
-        {
-            return Result<TransactionResponse>.Failure(ErrorCodes.NotFound, "Account not found.");
-        }
-
-        if (!account.IsActive)
-        {
-            return Result<TransactionResponse>.Failure(ErrorCodes.BusinessRule, "Account is not active.");
-        }
-
-        var now = _clock.UtcNow;
-        if (await _limitChecker.WouldExceedDailyLimitAsync(
-            account.Id,
-            account.DailyDebitLimit,
-            request.Amount,
-            now,
-            cancellationToken))
-        {
-            return Result<TransactionResponse>.Failure(
-                ErrorCodes.BusinessRule,
-                "Daily debit limit exceeded.");
-        }
 
         try
         {
-            account.Debit(request.Amount, now);
+            await _unitOfWork.BeginTransactionAsync(cancellationToken);
+            var account = await _accountRepository.GetByIdForUpdateAsync(request.AccountId, cancellationToken);
+            if (account is null)
+            {
+                await _unitOfWork.RollbackAsync(cancellationToken);
+                return Result<TransactionResponse>.Failure(ErrorCodes.NotFound, "Account not found.");
+            }
+
+            if (!account.IsActive)
+            {
+                await _unitOfWork.RollbackAsync(cancellationToken);
+                return Result<TransactionResponse>.Failure(ErrorCodes.BusinessRule, "Account is not active.");
+            }
+
+            var now = _clock.UtcNow;
+            if (await _limitChecker.WouldExceedDailyLimitAsync(
+                account.Id,
+                account.DailyDebitLimit,
+                request.Amount,
+                now,
+                cancellationToken))
+            {
+                await _unitOfWork.RollbackAsync(cancellationToken);
+                return Result<TransactionResponse>.Failure(
+                    ErrorCodes.BusinessRule,
+                    "Daily debit limit exceeded.");
+            }
+
+            try
+            {
+                account.Debit(request.Amount, now);
+            }
+            catch (InvalidOperationException ex)
+            {
+                await _unitOfWork.RollbackAsync(cancellationToken);
+                return Result<TransactionResponse>.Failure(ErrorCodes.BusinessRule, ex.Message);
+            }
+
+            var entry = LedgerEntry.Create(
+                account.Id,
+                reference,
+                LedgerEntryType.Debit,
+                request.Amount,
+                account.Balance,
+                request.Narrative.Trim(),
+                now);
+
+            await _accountRepository.UpdateAsync(account, cancellationToken);
+            await _ledgerRepository.AddAsync(entry, cancellationToken);
+            await _unitOfWork.CommitAsync(cancellationToken);
+
+            return Result<TransactionResponse>.Success(_transactionMapper.Map(entry, account.Currency));
         }
-        catch (InvalidOperationException ex)
+        catch (DuplicateResourceException)
         {
-            return Result<TransactionResponse>.Failure(ErrorCodes.BusinessRule, ex.Message);
+            await _unitOfWork.RollbackAsync(cancellationToken);
+            return Result<TransactionResponse>.Failure(ErrorCodes.Conflict, "Reference has already been processed.");
         }
-
-        var entry = LedgerEntry.Create(
-            account.Id,
-            reference,
-            LedgerEntryType.Debit,
-            request.Amount,
-            account.Balance,
-            request.Narrative.Trim(),
-            now);
-
-        await _accountRepository.UpdateAsync(account, cancellationToken);
-        await _ledgerRepository.AddAsync(entry, cancellationToken);
-        await _unitOfWork.CommitAsync(cancellationToken);
-
-        return Result<TransactionResponse>.Success(_transactionMapper.Map(entry, account.Currency));
+        catch
+        {
+            await _unitOfWork.RollbackAsync(cancellationToken);
+            throw;
+        }
     }
 }

@@ -73,37 +73,37 @@ public sealed class AccountService : IAccountService
             return Result<AccountResponse>.Failure(ErrorCodes.BusinessRule, "Inactive customer cannot open accounts.");
         }
 
-        string accountNumber = string.Empty;
-        var uniqueNumberFound = false;
         for (var retry = 0; retry < 10; retry++)
         {
-            accountNumber = _accountNumberGenerator.Generate();
-            var existing = await _accountRepository.GetByAccountNumberAsync(accountNumber, cancellationToken);
-            if (existing is null)
+            var accountNumber = _accountNumberGenerator.Generate();
+            var account = Account.OpenNew(
+                request.CustomerId,
+                accountNumber,
+                request.AccountType,
+                request.Currency,
+                request.DailyDebitLimit,
+                _clock.UtcNow);
+
+            try
             {
-                uniqueNumberFound = true;
-                break;
+                await _unitOfWork.BeginTransactionAsync(cancellationToken);
+                await _accountRepository.AddAsync(account, cancellationToken);
+                await _unitOfWork.CommitAsync(cancellationToken);
+
+                return Result<AccountResponse>.Success(_accountMapper.Map(account));
+            }
+            catch (DuplicateResourceException)
+            {
+                await _unitOfWork.RollbackAsync(cancellationToken);
+            }
+            catch
+            {
+                await _unitOfWork.RollbackAsync(cancellationToken);
+                throw;
             }
         }
 
-        if (!uniqueNumberFound)
-        {
-            return Result<AccountResponse>.Failure(ErrorCodes.Conflict, "Unable to generate a unique account number.");
-        }
-
-        var account = Account.OpenNew(
-            request.CustomerId,
-            accountNumber,
-            request.AccountType,
-            request.Currency,
-            request.DailyDebitLimit,
-            _clock.UtcNow);
-
-        await _unitOfWork.BeginTransactionAsync(cancellationToken);
-        await _accountRepository.AddAsync(account, cancellationToken);
-        await _unitOfWork.CommitAsync(cancellationToken);
-        
-        return Result<AccountResponse>.Success(_accountMapper.Map(account));
+        return Result<AccountResponse>.Failure(ErrorCodes.Conflict, "Unable to generate a unique account number.");
     }
 
     public async Task<Result<AccountResponse>> GetByIdAsync(Guid accountId, CancellationToken cancellationToken)

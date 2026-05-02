@@ -1,3 +1,4 @@
+using System.Reflection;
 using Banking.Application.Interfaces;
 using Banking.Infrastructure.Configuration;
 using Microsoft.Data.SqlClient;
@@ -31,10 +32,15 @@ internal sealed class DatabaseInitializer : IDatabaseInitializer
         await using var connection = _connectionFactory.Create();
         await connection.OpenAsync(cancellationToken);
 
-        await using (var createSchemaCommand = connection.CreateCommand())
+        await EnsureMigrationTableAsync(connection, cancellationToken);
+        foreach (var migration in GetMigrationScripts())
         {
-            createSchemaCommand.CommandText = GetSchemaScript();
-            await createSchemaCommand.ExecuteNonQueryAsync(cancellationToken);
+            if (await MigrationAlreadyAppliedAsync(connection, migration.Version, cancellationToken))
+            {
+                continue;
+            }
+
+            await ApplyMigrationAsync(connection, migration, cancellationToken);
         }
 
         await EnsureAdminUserAsync(connection, cancellationToken);
@@ -119,94 +125,91 @@ VALUES
         await insertCommand.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private static string GetSchemaScript()
+    private static async Task EnsureMigrationTableAsync(SqlConnection connection, CancellationToken cancellationToken)
     {
-        return @"
-IF OBJECT_ID(N'dbo.Users', N'U') IS NULL
+        await using var command = connection.CreateCommand();
+        command.CommandText = @"
+IF OBJECT_ID(N'dbo.__SchemaMigrations', N'U') IS NULL
 BEGIN
-    CREATE TABLE dbo.Users
+    CREATE TABLE dbo.__SchemaMigrations
     (
-        Id UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
-        Username NVARCHAR(100) NOT NULL UNIQUE,
-        PasswordHash VARBINARY(MAX) NOT NULL,
-        PasswordSalt VARBINARY(64) NOT NULL,
-        PasswordIterations INT NOT NULL,
-        Role INT NOT NULL,
-        IsActive BIT NOT NULL,
-        CreatedAtUtc DATETIME2 NOT NULL
+        Version NVARCHAR(200) NOT NULL PRIMARY KEY,
+        AppliedAtUtc DATETIME2 NOT NULL
     );
-END;
+END;";
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
 
-IF OBJECT_ID(N'dbo.Customers', N'U') IS NULL
-BEGIN
-    CREATE TABLE dbo.Customers
-    (
-        Id UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
-        FullName NVARCHAR(200) NOT NULL,
-        Email NVARCHAR(200) NOT NULL UNIQUE,
-        PhoneNumber NVARCHAR(30) NOT NULL,
-        KycStatus INT NOT NULL,
-        IsActive BIT NOT NULL,
-        CreatedAtUtc DATETIME2 NOT NULL
-    );
-END;
+    private static async Task<bool> MigrationAlreadyAppliedAsync(
+        SqlConnection connection,
+        string version,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(1) FROM dbo.__SchemaMigrations WHERE Version = @Version;";
+        command.Parameters.Add(new SqlParameter("@Version", System.Data.SqlDbType.NVarChar, 200) { Value = version });
 
-IF OBJECT_ID(N'dbo.Accounts', N'U') IS NULL
-BEGIN
-    CREATE TABLE dbo.Accounts
-    (
-        Id UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
-        AccountNumber NVARCHAR(30) NOT NULL UNIQUE,
-        CustomerId UNIQUEIDENTIFIER NOT NULL,
-        AccountType INT NOT NULL,
-        Currency CHAR(3) NOT NULL,
-        Balance DECIMAL(18, 2) NOT NULL,
-        DailyDebitLimit DECIMAL(18, 2) NOT NULL,
-        IsActive BIT NOT NULL,
-        CreatedAtUtc DATETIME2 NOT NULL,
-        LastUpdatedAtUtc DATETIME2 NOT NULL,
-        CONSTRAINT FK_Accounts_Customers FOREIGN KEY (CustomerId) REFERENCES dbo.Customers(Id)
-    );
-    CREATE INDEX IX_Accounts_CustomerId ON dbo.Accounts(CustomerId);
-END;
+        var count = Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken));
+        return count > 0;
+    }
 
-IF OBJECT_ID(N'dbo.Transfers', N'U') IS NULL
-BEGIN
-    CREATE TABLE dbo.Transfers
-    (
-        Id UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
-        ExternalReference NVARCHAR(64) NOT NULL UNIQUE,
-        FromAccountId UNIQUEIDENTIFIER NOT NULL,
-        ToAccountId UNIQUEIDENTIFIER NOT NULL,
-        Amount DECIMAL(18, 2) NOT NULL,
-        Currency CHAR(3) NOT NULL,
-        Narrative NVARCHAR(300) NOT NULL,
-        Status INT NOT NULL,
-        CreatedAtUtc DATETIME2 NOT NULL,
-        CompletedAtUtc DATETIME2 NULL,
-        CONSTRAINT FK_Transfers_FromAccount FOREIGN KEY (FromAccountId) REFERENCES dbo.Accounts(Id),
-        CONSTRAINT FK_Transfers_ToAccount FOREIGN KEY (ToAccountId) REFERENCES dbo.Accounts(Id)
-    );
-    CREATE INDEX IX_Transfers_FromAccountId ON dbo.Transfers(FromAccountId);
-    CREATE INDEX IX_Transfers_ToAccountId ON dbo.Transfers(ToAccountId);
-END;
+    private static async Task ApplyMigrationAsync(
+        SqlConnection connection,
+        MigrationScript migration,
+        CancellationToken cancellationToken)
+    {
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
 
-IF OBJECT_ID(N'dbo.LedgerEntries', N'U') IS NULL
-BEGIN
-    CREATE TABLE dbo.LedgerEntries
-    (
-        Id UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
-        AccountId UNIQUEIDENTIFIER NOT NULL,
-        Reference NVARCHAR(80) NOT NULL UNIQUE,
-        EntryType INT NOT NULL,
-        Amount DECIMAL(18, 2) NOT NULL,
-        BalanceAfter DECIMAL(18, 2) NOT NULL,
-        Narrative NVARCHAR(300) NOT NULL,
-        CreatedAtUtc DATETIME2 NOT NULL,
-        CONSTRAINT FK_LedgerEntries_Accounts FOREIGN KEY (AccountId) REFERENCES dbo.Accounts(Id)
-    );
-    CREATE INDEX IX_LedgerEntries_AccountId_CreatedAt ON dbo.LedgerEntries(AccountId, CreatedAtUtc DESC);
-END;
-";
+        try
+        {
+            await using var migrationCommand = connection.CreateCommand();
+            migrationCommand.Transaction = transaction;
+            migrationCommand.CommandText = migration.Sql;
+            await migrationCommand.ExecuteNonQueryAsync(cancellationToken);
+
+            await using var recordCommand = connection.CreateCommand();
+            recordCommand.Transaction = transaction;
+            recordCommand.CommandText = @"
+INSERT INTO dbo.__SchemaMigrations (Version, AppliedAtUtc)
+VALUES (@Version, @AppliedAtUtc);";
+            recordCommand.Parameters.Add(new SqlParameter("@Version", System.Data.SqlDbType.NVarChar, 200) { Value = migration.Version });
+            recordCommand.Parameters.Add(new SqlParameter("@AppliedAtUtc", System.Data.SqlDbType.DateTime2) { Value = DateTime.UtcNow });
+            await recordCommand.ExecuteNonQueryAsync(cancellationToken);
+
+            await transaction.CommitAsync(cancellationToken);
+        }
+        catch
+        {
+            if (transaction.Connection is not null)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+            }
+
+            throw;
+        }
+    }
+
+    private static IReadOnlyCollection<MigrationScript> GetMigrationScripts()
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        var resourceNames = assembly.GetManifestResourceNames()
+            .Where(name => name.Contains(".Data.Migrations.", StringComparison.Ordinal) && name.EndsWith(".sql", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+
+        var migrations = new List<MigrationScript>(resourceNames.Length);
+        foreach (var resourceName in resourceNames)
+        {
+            using var stream = assembly.GetManifestResourceStream(resourceName)
+                ?? throw new InvalidOperationException($"Unable to load migration resource '{resourceName}'.");
+            using var reader = new StreamReader(stream);
+            var sql = reader.ReadToEnd();
+            var markerIndex = resourceName.LastIndexOf(".Data.Migrations.", StringComparison.Ordinal);
+            var fileName = resourceName[(markerIndex + ".Data.Migrations.".Length)..];
+            var version = Path.GetFileNameWithoutExtension(fileName);
+            migrations.Add(new MigrationScript(version, sql));
+        }
+
+        return migrations;
     }
 }

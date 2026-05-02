@@ -1,3 +1,4 @@
+using Banking.Application.Common;
 using Banking.Application.Interfaces;
 using Banking.Domain.Entities;
 using Banking.Domain.Enums;
@@ -83,7 +84,14 @@ VALUES
             Value = transfer.CompletedAtUtc ?? (object)DBNull.Value
         });
 
-        await command.ExecuteNonQueryAsync(cancellationToken);
+        try
+        {
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+        catch (SqlException ex) when (ex.IsUniqueConstraintViolation())
+        {
+            throw new DuplicateResourceException("transfer", "external reference", transfer.ExternalReference, ex);
+        }
         }, cancellationToken);
     }
 

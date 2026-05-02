@@ -15,6 +15,7 @@ public static class ServiceCollectionExtensions
         services.Configure<SqlServerOptions>(configuration.GetSection(SqlServerOptions.SectionName));
         services.Configure<JwtOptions>(configuration.GetSection(JwtOptions.SectionName));
         services.Configure<AdminSeedOptions>(configuration.GetSection(AdminSeedOptions.SectionName));
+        services.Configure<DatabaseInitializationOptions>(configuration.GetSection(DatabaseInitializationOptions.SectionName));
 
         services.AddSingleton<ISqlConnectionFactory, SqlConnectionFactory>();
 
